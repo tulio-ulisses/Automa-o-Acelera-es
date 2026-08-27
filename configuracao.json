@@ -1,0 +1,45 @@
+{
+    "quantidade_por_responsavel": 2,
+    "agendamento": {
+        "agrupamento": "Verificar",
+        "id_agrupamento": 4,
+        "tipo_compromisso": "Acelerar",
+        "id_tipo_compromisso": 3,
+        "descricao": "Aceleração diária agendada pela automação"
+    },
+    "responsaveis": [
+        {
+            "nome": "João Ronaldo",
+            "idusuario": 26,
+            "ativo": true
+        },
+        {
+            "nome": "Tainara Halmenschlager",
+            "idusuario": 30,
+            "ativo": true
+        },
+        {
+            "nome": "Henrique Lima",
+            "idusuario": 37,
+            "ativo": true
+        },
+        {
+            "nome": "Lais Natalia",
+            "idusuario": 34,
+            "ativo": true
+        },
+        {
+            "nome": "Matheus Padilha",
+            "idusuario": 32,
+            "ativo": true
+        }
+    ],
+    "dias_sem_execucao": [],
+    "ausencias": {
+        "João Ronaldo": [],
+        "Tainara Halmenschlager": [],
+        "Henrique Lima": [],
+        "Lais Natalia": [],
+        "Matheus Padilha": []
+    }
+}
