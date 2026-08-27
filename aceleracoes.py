@@ -26,7 +26,6 @@ URL_INDISPONIBILIDADES = (
 )
 
 LOTE_SUPABASE = 1000
-
 FUSO_BRASILIA = ZoneInfo("America/Sao_Paulo")
 
 MAPA_NOMES_PLANILHA = {
@@ -94,9 +93,7 @@ def valor_vazio(valor):
         return True
 
     return (
-        str(valor)
-        .strip()
-        .lower()
+        str(valor).strip().lower()
         in {
             "",
             "none",
@@ -121,6 +118,31 @@ def inteiro(valor):
         )
     except (TypeError, ValueError):
         return None
+
+
+def converter_data(valor):
+    if valor_vazio(valor):
+        return None
+
+    texto = str(valor).strip()
+
+    formatos = (
+        ("%Y-%m-%d", texto[:10]),
+        ("%d/%m/%Y", texto[:10]),
+        ("%d-%m-%Y", texto[:10]),
+        ("%d/%m/%y", texto[:8]),
+    )
+
+    for formato, trecho in formatos:
+        try:
+            return datetime.strptime(
+                trecho,
+                formato,
+            ).date()
+        except ValueError:
+            continue
+
+    return None
 
 
 def carregar_configuracao():
@@ -223,32 +245,9 @@ def resolver_coluna(
     return None
 
 
-def converter_data_planilha(valor):
-    if valor_vazio(valor):
-        return None
-
-    texto = str(valor).strip()
-
-    formatos = (
-        "%d/%m/%Y",
-        "%Y-%m-%d",
-        "%d-%m-%Y",
-        "%d/%m/%y",
-    )
-
-    for formato in formatos:
-        try:
-            return datetime.strptime(
-                texto,
-                formato,
-            ).date()
-        except ValueError:
-            continue
-
-    return None
-
-
-def carregar_indisponibilidades(hoje):
+def carregar_indisponibilidades(
+    hoje,
+):
     resposta = requests.get(
         URL_INDISPONIBILIDADES,
         timeout=30,
@@ -266,34 +265,26 @@ def carregar_indisponibilidades(hoje):
 
     for linha in leitor:
         mapa_linha = {
-            normalizar_texto(chave):
-                valor
-            for chave, valor
-            in linha.items()
+            normalizar_texto(chave): valor
+            for chave, valor in linha.items()
             if chave
         }
 
         nome = normalizar_texto(
-            mapa_linha.get(
-                "nome"
-            )
+            mapa_linha.get("nome")
         )
 
-        data = converter_data_planilha(
-            mapa_linha.get(
-                "data"
-            )
+        data = converter_data(
+            mapa_linha.get("data")
         )
 
-        if (
-            not nome
-            or not data
-        ):
+        if not nome or not data:
             continue
 
         nome_completo = (
-            MAPA_NOMES_PLANILHA
-            .get(nome)
+            MAPA_NOMES_PLANILHA.get(
+                nome
+            )
         )
 
         if not nome_completo:
@@ -497,6 +488,7 @@ def criar_mapa_ultimo_historico(
 
 def obter_processos_acelerados_agenda(
     agenda,
+    hoje,
 ):
     if not agenda:
         return set()
@@ -526,6 +518,15 @@ def obter_processos_acelerados_agenda(
         ],
     )
 
+    coluna_data = resolver_coluna(
+        agenda,
+        [
+            "prazo",
+            "data",
+            "data1",
+        ],
+    )
+
     acelerados = set()
 
     for registro in agenda:
@@ -547,6 +548,15 @@ def obter_processos_acelerados_agenda(
         ):
             continue
 
+        data_agenda = converter_data(
+            registro.get(
+                coluna_data
+            )
+        )
+
+        if data_agenda != hoje.date():
+            continue
+
         processo = normalizar_processo(
             registro.get(
                 coluna_processo
@@ -563,10 +573,20 @@ def obter_processos_acelerados_agenda(
 
 def obter_processos_controle(
     controle,
+    hoje,
 ):
     bloqueados = set()
 
     for registro in controle:
+        data_agendamento = converter_data(
+            registro.get(
+                "data_agendamento"
+            )
+        )
+
+        if data_agendamento != hoje.date():
+            continue
+
         status = normalizar_texto(
             registro.get(
                 "status"
@@ -676,13 +696,15 @@ def selecionar_processos(
 
     acelerados_agenda = (
         obter_processos_acelerados_agenda(
-            agenda
+            agenda,
+            hoje,
         )
     )
 
     acelerados_controle = (
         obter_processos_controle(
-            controle
+            controle,
+            hoje,
         )
     )
 
@@ -863,7 +885,9 @@ def mostrar_resultado(
         print(
             "Indisponíveis hoje: "
             + ", ".join(
-                sorted(indisponiveis)
+                sorted(
+                    indisponiveis
+                )
             )
         )
     else:
@@ -978,7 +1002,9 @@ def main():
         "Indisponíveis hoje: "
         + (
             ", ".join(
-                sorted(indisponiveis)
+                sorted(
+                    indisponiveis
+                )
             )
             if indisponiveis
             else "nenhum"
