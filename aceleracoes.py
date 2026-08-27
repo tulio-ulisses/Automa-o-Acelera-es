@@ -504,6 +504,7 @@ def obter_processos_acelerados_agenda(
     coluna_processo = resolver_coluna(
         agenda,
         [
+            "no_processo",
             "processo",
             "numero_processo",
             "n_de_processo",
