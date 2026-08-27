@@ -2,11 +2,18 @@ name: Acelerações diárias
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: "17 5 * * 1-5"
+      timezone: "America/Sao_Paulo"
+
+concurrency:
+  group: aceleracoes-diarias
+  cancel-in-progress: false
 
 jobs:
   criar-aceleracoes:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
 
     env:
       IILEX_USERNAME: ${{ secrets.IILEX_USERNAME }}

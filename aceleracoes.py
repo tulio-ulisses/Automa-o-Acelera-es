@@ -1,8 +1,11 @@
+
 import os
 import re
 import csv
 import io
 import json
+import time
+import base64
 import unicodedata
 from datetime import datetime
 from pathlib import Path
@@ -14,6 +17,7 @@ from supabase import create_client
 
 ARQUIVO_CONFIGURACAO = Path("configuracao.json")
 
+BASE_URL = "https://juscash.iilex.com.br/sistema"
 TABELA_CONTENCIOSO = "contencioso"
 TABELA_AGENDA = "agenda"
 TABELA_ULTIMO_HISTORICO = "ultimo_historico_por_processo"
@@ -26,6 +30,10 @@ URL_INDISPONIBILIDADES = (
 )
 
 LOTE_SUPABASE = 1000
+INTERVALO_ENTRE_AGENDAMENTOS = 2.5
+ESPERA_429 = 65
+MAX_TENTATIVAS_POST = 5
+
 FUSO_BRASILIA = ZoneInfo("America/Sao_Paulo")
 
 MAPA_NOMES_PLANILHA = {
@@ -39,12 +47,8 @@ MAPA_NOMES_PLANILHA = {
 
 def env(nome):
     valor = os.getenv(nome)
-
     if not valor:
-        raise RuntimeError(
-            f"Variável de ambiente ausente: {nome}"
-        )
-
+        raise RuntimeError(f"Variável de ambiente ausente: {nome}")
     return valor
 
 
@@ -53,55 +57,22 @@ def normalizar_texto(valor):
         return ""
 
     texto = str(valor).strip()
-
-    texto = unicodedata.normalize(
-        "NFKD",
-        texto,
-    ).encode(
-        "ASCII",
-        "ignore",
-    ).decode()
-
+    texto = unicodedata.normalize("NFKD", texto).encode("ASCII", "ignore").decode()
     texto = texto.casefold()
-
-    texto = re.sub(
-        r"[^a-z0-9]+",
-        " ",
-        texto,
-    )
-
-    return re.sub(
-        r"\s+",
-        " ",
-        texto,
-    ).strip()
+    texto = re.sub(r"[^a-z0-9]+", " ", texto)
+    return re.sub(r"\s+", " ", texto).strip()
 
 
 def normalizar_processo(valor):
     if valor is None:
         return ""
-
-    return re.sub(
-        r"\D",
-        "",
-        str(valor),
-    )
+    return re.sub(r"\D", "", str(valor))
 
 
 def valor_vazio(valor):
     if valor is None:
         return True
-
-    return (
-        str(valor).strip().lower()
-        in {
-            "",
-            "none",
-            "null",
-            "nan",
-            "nat",
-        }
-    )
+    return str(valor).strip().lower() in {"", "none", "null", "nan", "nat"}
 
 
 def inteiro(valor):
@@ -109,13 +80,7 @@ def inteiro(valor):
         return None
 
     try:
-        return int(
-            float(
-                str(valor)
-                .strip()
-                .replace(",", ".")
-            )
-        )
+        return int(float(str(valor).strip().replace(",", ".")))
     except (TypeError, ValueError):
         return None
 
@@ -126,19 +91,16 @@ def converter_data(valor):
 
     texto = str(valor).strip()
 
-    formatos = (
+    tentativas = [
         ("%Y-%m-%d", texto[:10]),
         ("%d/%m/%Y", texto[:10]),
         ("%d-%m-%Y", texto[:10]),
         ("%d/%m/%y", texto[:8]),
-    )
+    ]
 
-    for formato, trecho in formatos:
+    for formato, trecho in tentativas:
         try:
-            return datetime.strptime(
-                trecho,
-                formato,
-            ).date()
+            return datetime.strptime(trecho, formato).date()
         except ValueError:
             continue
 
@@ -147,15 +109,9 @@ def converter_data(valor):
 
 def carregar_configuracao():
     if not ARQUIVO_CONFIGURACAO.exists():
-        raise RuntimeError(
-            "Arquivo configuracao.json não encontrado."
-        )
+        raise RuntimeError("Arquivo configuracao.json não encontrado.")
 
-    with open(
-        ARQUIVO_CONFIGURACAO,
-        "r",
-        encoding="utf-8",
-    ) as arquivo:
+    with open(ARQUIVO_CONFIGURACAO, "r", encoding="utf-8") as arquivo:
         return json.load(arquivo)
 
 
@@ -166,33 +122,40 @@ def criar_supabase():
     )
 
 
-def ler_tabela(
-    supabase,
-    tabela,
-):
+def criar_sessao_iilex():
+    username = env("IILEX_USERNAME")
+    password = env("IILEX_PASSWORD")
+
+    token = base64.b64encode(
+        f"{username}:{password}".encode("utf-8")
+    ).decode("utf-8")
+
+    sessao = requests.Session()
+    sessao.headers.update(
+        {
+            "Authorization": f"Basic {token}",
+            "Accept": "application/json",
+        }
+    )
+    return sessao
+
+
+def ler_tabela(supabase, tabela):
     registros = []
     inicio = 0
 
     while True:
-        fim = (
-            inicio
-            + LOTE_SUPABASE
-            - 1
-        )
+        fim = inicio + LOTE_SUPABASE - 1
 
         resposta = (
             supabase
             .table(tabela)
             .select("*")
-            .range(
-                inicio,
-                fim,
-            )
+            .range(inicio, fim)
             .execute()
         )
 
         lote = resposta.data or []
-
         registros.extend(lote)
 
         if len(lote) < LOTE_SUPABASE:
@@ -203,64 +166,41 @@ def ler_tabela(
     return registros
 
 
-def resolver_coluna(
-    registros,
-    candidatos,
-    obrigatoria=True,
-):
+def resolver_coluna(registros, candidatos, obrigatoria=True):
     if not registros:
         if obrigatoria:
-            raise RuntimeError(
-                "Tabela sem registros."
-            )
-
+            raise RuntimeError("Tabela sem registros.")
         return None
 
-    colunas = list(
-        registros[0].keys()
-    )
+    colunas = list(registros[0].keys())
 
     mapa = {
-        normalizar_texto(coluna)
-        .replace(" ", "_"): coluna
+        normalizar_texto(coluna).replace(" ", "_"): coluna
         for coluna in colunas
     }
 
     for candidato in candidatos:
-        chave = (
-            normalizar_texto(candidato)
-            .replace(" ", "_")
-        )
-
+        chave = normalizar_texto(candidato).replace(" ", "_")
         if chave in mapa:
             return mapa[chave]
 
     if obrigatoria:
         raise RuntimeError(
-            "Nenhuma das colunas esperadas "
-            f"foi encontrada: {candidatos}. "
-            f"Colunas disponíveis: {colunas}"
+            "Nenhuma das colunas esperadas foi encontrada: "
+            f"{candidatos}. Colunas disponíveis: {colunas}"
         )
 
     return None
 
 
-def carregar_indisponibilidades(
-    hoje,
-):
+def carregar_indisponibilidades(hoje):
     resposta = requests.get(
         URL_INDISPONIBILIDADES,
         timeout=30,
     )
-
     resposta.raise_for_status()
 
-    leitor = csv.DictReader(
-        io.StringIO(
-            resposta.text
-        )
-    )
-
+    leitor = csv.DictReader(io.StringIO(resposta.text))
     indisponiveis = set()
 
     for linha in leitor:
@@ -270,107 +210,41 @@ def carregar_indisponibilidades(
             if chave
         }
 
-        nome = normalizar_texto(
-            mapa_linha.get("nome")
-        )
-
-        data = converter_data(
-            mapa_linha.get("data")
-        )
+        nome = normalizar_texto(mapa_linha.get("nome"))
+        data = converter_data(mapa_linha.get("data"))
 
         if not nome or not data:
             continue
 
-        nome_completo = (
-            MAPA_NOMES_PLANILHA.get(
-                nome
-            )
-        )
-
+        nome_completo = MAPA_NOMES_PLANILHA.get(nome)
         if not nome_completo:
             continue
 
         if data == hoje.date():
-            indisponiveis.add(
-                nome_completo
-            )
+            indisponiveis.add(nome_completo)
 
     return indisponiveis
 
 
-def data_execucao_valida(
-    configuracao,
-    hoje,
-):
+def data_execucao_valida(configuracao, hoje):
     if hoje.weekday() >= 5:
-        return (
-            False,
-            "sábado ou domingo",
-        )
+        return False, "sábado ou domingo"
 
-    data_texto = hoje.strftime(
-        "%Y-%m-%d"
-    )
-
-    dias_sem_execucao = set(
-        configuracao.get(
-            "dias_sem_execucao",
-            [],
-        )
-    )
+    data_texto = hoje.strftime("%Y-%m-%d")
+    dias_sem_execucao = set(configuracao.get("dias_sem_execucao", []))
 
     if data_texto in dias_sem_execucao:
-        return (
-            False,
-            "data configurada sem execução",
-        )
+        return False, "data configurada sem execução"
 
     return True, ""
 
 
-def responsavel_ausente_configuracao(
-    configuracao,
-    nome,
-    hoje,
-):
-    data_texto = hoje.strftime(
-        "%Y-%m-%d"
-    )
-
-    ausencias = (
-        configuracao
-        .get(
-            "ausencias",
-            {},
-        )
-        .get(
-            nome,
-            [],
-        )
-    )
-
-    return (
-        data_texto
-        in ausencias
-    )
-
-
 def eh_risco_4(valor):
-    texto = normalizar_texto(
-        valor
-    )
-
-    return texto in {
-        "4",
-        "risco 4",
-    }
+    return normalizar_texto(valor) in {"4", "risco 4"}
 
 
 def status_ativo(valor):
-    return (
-        normalizar_texto(valor)
-        == "ativo"
-    )
+    return normalizar_texto(valor) == "ativo"
 
 
 def responsavel_corresponde(
@@ -379,117 +253,55 @@ def responsavel_corresponde(
     coluna_id_responsavel,
     coluna_nome_responsavel,
 ):
-    id_config = inteiro(
-        responsavel_config.get(
-            "idusuario"
-        )
-    )
+    id_config = inteiro(responsavel_config.get("idusuario"))
 
     if coluna_id_responsavel:
-        id_registro = inteiro(
-            registro.get(
-                coluna_id_responsavel
-            )
-        )
+        id_registro = inteiro(registro.get(coluna_id_responsavel))
 
-        if (
-            id_registro is not None
-            and id_config is not None
-        ):
-            return (
-                id_registro
-                == id_config
-            )
+        if id_registro is not None and id_config is not None:
+            return id_registro == id_config
 
     if not coluna_nome_responsavel:
         return False
 
-    nome_registro = normalizar_texto(
-        registro.get(
-            coluna_nome_responsavel
-        )
-    )
-
-    nome_config = normalizar_texto(
-        responsavel_config.get(
-            "nome"
-        )
-    )
+    nome_registro = normalizar_texto(registro.get(coluna_nome_responsavel))
+    nome_config = normalizar_texto(responsavel_config.get("nome"))
 
     if nome_registro == nome_config:
         return True
 
-    if (
-        nome_registro
-        and nome_config
-        and nome_registro.startswith(
-            nome_config
-        )
-    ):
+    if nome_registro and nome_config and nome_registro.startswith(nome_config):
         return True
 
-    primeiro_registro = (
-        nome_registro.split()[0]
-        if nome_registro
-        else ""
-    )
+    primeiro_registro = nome_registro.split()[0] if nome_registro else ""
+    primeiro_config = nome_config.split()[0] if nome_config else ""
 
-    primeiro_config = (
-        nome_config.split()[0]
-        if nome_config
-        else ""
-    )
-
-    return (
+    return bool(
         primeiro_registro
-        and primeiro_registro
-        == primeiro_config
+        and primeiro_registro == primeiro_config
     )
 
 
-def criar_mapa_ultimo_historico(
-    historico,
-):
+def criar_mapa_ultimo_historico(historico):
     mapa = {}
 
     for registro in historico:
-        idprocesso = str(
-            registro.get(
-                "idprocesso",
-                ""
-            )
-        ).strip()
+        idprocesso = str(registro.get("idprocesso", "")).strip()
+        data = registro.get("data_ultimo_historico")
 
-        data = registro.get(
-            "data_ultimo_historico"
-        )
-
-        if (
-            not idprocesso
-            or valor_vazio(data)
-        ):
+        if not idprocesso or valor_vazio(data):
             continue
 
-        try:
-            data_convertida = (
-                datetime.fromisoformat(
-                    str(data)[:10]
-                )
-            )
-        except ValueError:
+        data_convertida = converter_data(data)
+        if not data_convertida:
             continue
 
-        mapa[idprocesso] = (
-            data_convertida
-        )
+        mapa[idprocesso] = data_convertida
 
     return mapa
 
 
-def obter_processos_acelerados_agenda(
-    agenda,
-    hoje,
-):
+def obter_processos_acelerados_agenda(agenda, hoje):
     if not agenda:
         return set()
 
@@ -530,17 +342,9 @@ def obter_processos_acelerados_agenda(
     acelerados = set()
 
     for registro in agenda:
-        tipo = registro.get(
-            coluna_tipo
-        )
-
-        tipo_texto = normalizar_texto(
-            tipo
-        )
-
-        tipo_id = inteiro(
-            tipo
-        )
+        tipo = registro.get(coluna_tipo)
+        tipo_texto = normalizar_texto(tipo)
+        tipo_id = inteiro(tipo)
 
         if not (
             tipo_id == 3
@@ -548,67 +352,34 @@ def obter_processos_acelerados_agenda(
         ):
             continue
 
-        data_agenda = converter_data(
-            registro.get(
-                coluna_data
-            )
-        )
-
+        data_agenda = converter_data(registro.get(coluna_data))
         if data_agenda != hoje.date():
             continue
 
-        processo = normalizar_processo(
-            registro.get(
-                coluna_processo
-            )
-        )
-
+        processo = normalizar_processo(registro.get(coluna_processo))
         if processo:
-            acelerados.add(
-                processo
-            )
+            acelerados.add(processo)
 
     return acelerados
 
 
-def obter_processos_controle(
-    controle,
-    hoje,
-):
+def obter_processos_controle(controle, hoje):
     bloqueados = set()
 
     for registro in controle:
         data_agendamento = converter_data(
-            registro.get(
-                "data_agendamento"
-            )
+            registro.get("data_agendamento")
         )
 
         if data_agendamento != hoje.date():
             continue
 
-        status = normalizar_texto(
-            registro.get(
-                "status"
-            )
-        )
-
-        if status in {
-            "erro iilex",
-            "cancelado",
-        }:
-            continue
-
         processo = normalizar_processo(
-            registro.get(
-                "processo"
-            )
+            registro.get("processo")
         )
 
         if processo:
-            bloqueados.add(
-                processo
-            )
+            bloqueados.add(processo)
 
     return bloqueados
 
@@ -682,58 +453,22 @@ def selecionar_processos(
             "advogado_responsavel",
             "responsavel_atual",
         ],
-        obrigatoria=(
-            coluna_id_responsavel
-            is None
-        ),
+        obrigatoria=coluna_id_responsavel is None,
     )
 
-    mapa_historico = (
-        criar_mapa_ultimo_historico(
-            historico
-        )
-    )
+    mapa_historico = criar_mapa_ultimo_historico(historico)
+    acelerados_agenda = obter_processos_acelerados_agenda(agenda, hoje)
+    acelerados_controle = obter_processos_controle(controle, hoje)
 
-    acelerados_agenda = (
-        obter_processos_acelerados_agenda(
-            agenda,
-            hoje,
-        )
-    )
-
-    acelerados_controle = (
-        obter_processos_controle(
-            controle,
-            hoje,
-        )
-    )
-
-    bloqueados = (
-        acelerados_agenda
-        | acelerados_controle
-    )
-
-    quantidade = int(
-        configuracao.get(
-            "quantidade_por_responsavel",
-            2,
-        )
-    )
+    bloqueados = acelerados_agenda | acelerados_controle
+    quantidade = int(configuracao.get("quantidade_por_responsavel", 2))
 
     resultado = {}
 
-    for responsavel in configuracao.get(
-        "responsaveis",
-        [],
-    ):
-        nome = responsavel.get(
-            "nome"
-        )
+    for responsavel in configuracao.get("responsaveis", []):
+        nome = responsavel.get("nome")
 
-        if not responsavel.get(
-            "ativo",
-            True,
-        ):
+        if not responsavel.get("ativo", True):
             resultado[nome] = []
             continue
 
@@ -741,29 +476,13 @@ def selecionar_processos(
             resultado[nome] = []
             continue
 
-        if responsavel_ausente_configuracao(
-            configuracao,
-            nome,
-            hoje,
-        ):
-            resultado[nome] = []
-            continue
-
         candidatos = []
 
         for registro in contencioso:
-            if not status_ativo(
-                registro.get(
-                    coluna_status
-                )
-            ):
+            if not status_ativo(registro.get(coluna_status)):
                 continue
 
-            if eh_risco_4(
-                registro.get(
-                    coluna_risco
-                )
-            ):
+            if eh_risco_4(registro.get(coluna_risco)):
                 continue
 
             if not responsavel_corresponde(
@@ -775,299 +494,340 @@ def selecionar_processos(
                 continue
 
             processo_original = str(
-                registro.get(
-                    coluna_processo,
-                    ""
-                )
+                registro.get(coluna_processo, "")
             ).strip()
 
-            processo = normalizar_processo(
-                processo_original
-            )
+            processo = normalizar_processo(processo_original)
 
-            if not processo:
-                continue
-
-            if processo in bloqueados:
+            if not processo or processo in bloqueados:
                 continue
 
             idprocesso = str(
-                registro.get(
-                    coluna_idprocesso,
-                    ""
-                )
+                registro.get(coluna_idprocesso, "")
             ).strip()
 
             if not idprocesso:
                 continue
 
-            data_ultimo_historico = (
-                mapa_historico.get(
-                    idprocesso
-                )
-            )
-
+            data_ultimo_historico = mapa_historico.get(idprocesso)
             if not data_ultimo_historico:
                 continue
 
             candidatos.append(
                 {
-                    "processo":
-                        processo,
-
-                    "processo_original":
-                        processo_original,
-
-                    "idprocesso":
-                        idprocesso,
-
-                    "responsavel":
-                        nome,
-
-                    "idusuario":
-                        responsavel.get(
-                            "idusuario"
-                        ),
-
-                    "risco":
-                        registro.get(
-                            coluna_risco
-                        ),
-
-                    "status":
-                        registro.get(
-                            coluna_status
-                        ),
-
-                    "data_ultimo_historico":
-                        data_ultimo_historico,
+                    "processo": processo,
+                    "processo_original": processo_original,
+                    "idprocesso": idprocesso,
+                    "responsavel": nome,
+                    "idusuario": responsavel.get("idusuario"),
+                    "risco": registro.get(coluna_risco),
+                    "status": registro.get(coluna_status),
+                    "data_ultimo_historico": data_ultimo_historico,
                 }
             )
 
         candidatos.sort(
-            key=lambda item:
-                item[
-                    "data_ultimo_historico"
-                ]
+            key=lambda item: item["data_ultimo_historico"]
         )
 
-        resultado[nome] = (
-            candidatos[
-                :quantidade
-            ]
-        )
+        resultado[nome] = candidatos[:quantidade]
 
     return resultado
 
 
-def mostrar_resultado(
+def reservar_agendamento(supabase, item, hoje):
+    registro = {
+        "data_agendamento": hoje.strftime("%Y-%m-%d"),
+        "processo": item["processo_original"],
+        "idprocesso": item["idprocesso"],
+        "responsavel": item["responsavel"],
+        "idusuario": int(item["idusuario"]),
+        "data_ultimo_historico": item["data_ultimo_historico"].strftime(
+            "%Y-%m-%d"
+        ),
+        "status": "RESERVADO",
+        "atualizado_em": hoje.isoformat(),
+    }
+
+    try:
+        (
+            supabase
+            .table(TABELA_CONTROLE)
+            .insert(registro)
+            .execute()
+        )
+        return True
+    except Exception as erro:
+        texto = str(erro).lower()
+
+        if (
+            "duplicate" in texto
+            or "unique" in texto
+            or "23505" in texto
+        ):
+            return False
+
+        raise
+
+
+def atualizar_controle(
+    supabase,
+    item,
+    hoje,
+    status,
+    status_http=None,
+    retorno_iilex=None,
+):
+    dados = {
+        "status": status,
+        "status_http": status_http,
+        "retorno_iilex": retorno_iilex,
+        "atualizado_em": datetime.now(FUSO_BRASILIA).isoformat(),
+    }
+
+    (
+        supabase
+        .table(TABELA_CONTROLE)
+        .update(dados)
+        .eq(
+            "data_agendamento",
+            hoje.strftime("%Y-%m-%d"),
+        )
+        .eq(
+            "processo",
+            item["processo_original"],
+        )
+        .execute()
+    )
+
+
+def criar_agendamento_iilex(
+    sessao,
+    item,
+    configuracao,
+    hoje,
+):
+    agendamento = configuracao["agendamento"]
+    data_texto = hoje.strftime("%Y-%m-%d")
+
+    parametros = {
+        "idmodulotabelaprocesso1": 1,
+        "idprocesso1": item["idprocesso"],
+        "idtabaux30": agendamento["id_agrupamento"],
+        "idtipoagenda1": agendamento["id_tipo_compromisso"],
+        "memo1": agendamento["descricao"],
+        "idusuario1": item["idusuario"],
+        "data1": data_texto,
+        "data3": data_texto,
+        "opcao1": "N",
+        "texto10": item["processo_original"],
+        "data4": data_texto,
+    }
+
+    url = f"{BASE_URL}/api/public/v1/insert/modulo/Agenda"
+
+    ultima_resposta = None
+
+    for tentativa in range(1, MAX_TENTATIVAS_POST + 1):
+        try:
+            resposta = sessao.post(
+                url,
+                params=parametros,
+                timeout=30,
+            )
+
+            ultima_resposta = resposta
+
+            if resposta.status_code in (200, 201):
+                return True, resposta.status_code, resposta.text[:4000]
+
+            if resposta.status_code == 429:
+                if tentativa < MAX_TENTATIVAS_POST:
+                    time.sleep(ESPERA_429)
+                    continue
+
+            if 500 <= resposta.status_code <= 599:
+                if tentativa < MAX_TENTATIVAS_POST:
+                    time.sleep(10)
+                    continue
+
+            return False, resposta.status_code, resposta.text[:4000]
+
+        except requests.RequestException as erro:
+            if tentativa < MAX_TENTATIVAS_POST:
+                time.sleep(10)
+                continue
+
+            return False, None, str(erro)[:4000]
+
+    if ultima_resposta is not None:
+        return (
+            False,
+            ultima_resposta.status_code,
+            ultima_resposta.text[:4000],
+        )
+
+    return False, None, "Falha sem resposta do IILEX."
+
+
+def executar_agendamentos(
+    supabase,
+    sessao,
     selecionados,
+    configuracao,
     indisponiveis,
     hoje,
 ):
-    print()
-    print(
-        "=" * 90
-    )
-    print(
-        "SIMULAÇÃO DE ACELERAÇÕES"
-    )
-    print(
-        "=" * 90
+    total_selecionado = sum(
+        len(processos)
+        for processos in selecionados.values()
     )
 
-    print(
-        f"Data: "
-        f"{hoje.strftime('%d/%m/%Y')}"
-    )
-
-    if indisponiveis:
-        print(
-            "Indisponíveis hoje: "
-            + ", ".join(
-                sorted(
-                    indisponiveis
-                )
-            )
-        )
-    else:
-        print(
-            "Indisponíveis hoje: nenhum"
-        )
+    criados = 0
+    erros = 0
+    ignorados = 0
 
     print()
+    print("=" * 90)
+    print("CRIAÇÃO DE ACELERAÇÕES")
+    print("=" * 90)
+    print(f"Data: {hoje.strftime('%d/%m/%Y')}")
+    print(f"Selecionados: {total_selecionado}")
+    print()
 
-    total = 0
-
-    for responsavel, processos in (
-        selecionados.items()
-    ):
+    for responsavel, processos in selecionados.items():
         if responsavel in indisponiveis:
-            print(
-                f"{responsavel}: "
-                "INDISPONÍVEL"
-            )
-            print()
+            print(f"{responsavel}: INDISPONÍVEL")
             continue
 
-        print(
-            f"{responsavel}: "
-            f"{len(processos)} processo(s)"
-        )
+        print(f"{responsavel}: {len(processos)} processo(s)")
 
-        for numero, item in enumerate(
-            processos,
-            start=1,
-        ):
-            dias_sem_movimentacao = (
-                hoje.replace(
-                    tzinfo=None
-                )
-                - item[
-                    "data_ultimo_historico"
-                ]
-            ).days
-
-            print(
-                f"  {numero}. "
-                f"{item['processo_original']} | "
-                f"ID {item['idprocesso']} | "
-                f"Status {item['status']} | "
-                f"Risco {item['risco']} | "
-                f"Último histórico: "
-                f"{item['data_ultimo_historico'].strftime('%d/%m/%Y')} | "
-                f"{dias_sem_movimentacao} dias"
+        for item in processos:
+            reservado = reservar_agendamento(
+                supabase,
+                item,
+                hoje,
             )
+
+            if not reservado:
+                ignorados += 1
+                print(
+                    f"  IGNORADO | {item['processo_original']} | "
+                    "já reservado/agendado hoje"
+                )
+                continue
+
+            sucesso, status_http, retorno = criar_agendamento_iilex(
+                sessao,
+                item,
+                configuracao,
+                hoje,
+            )
+
+            if sucesso:
+                atualizar_controle(
+                    supabase,
+                    item,
+                    hoje,
+                    status="CONCLUIDO",
+                    status_http=status_http,
+                    retorno_iilex=retorno,
+                )
+
+                criados += 1
+
+                print(
+                    f"  CRIADO | {item['processo_original']} | "
+                    f"HTTP {status_http}"
+                )
+            else:
+                atualizar_controle(
+                    supabase,
+                    item,
+                    hoje,
+                    status="ERRO_IILEX",
+                    status_http=status_http,
+                    retorno_iilex=retorno,
+                )
+
+                erros += 1
+
+                print(
+                    f"  ERRO | {item['processo_original']} | "
+                    f"HTTP {status_http}"
+                )
+
+            time.sleep(INTERVALO_ENTRE_AGENDAMENTOS)
 
         print()
 
-        total += len(
-            processos
+    print("-" * 90)
+    print(f"CRIADOS: {criados}")
+    print(f"IGNORADOS: {ignorados}")
+    print(f"ERROS: {erros}")
+    print("-" * 90)
+
+    if erros:
+        raise RuntimeError(
+            f"{erros} agendamento(s) falharam no IILEX."
         )
-
-    print(
-        "-" * 90
-    )
-
-    print(
-        f"TOTAL QUE SERIA AGENDADO: "
-        f"{total}"
-    )
-
-    print(
-        "-" * 90
-    )
-
-    print()
-    print(
-        "MODO SIMULAÇÃO: "
-        "nenhum agendamento foi criado."
-    )
 
 
 def main():
-    configuracao = (
-        carregar_configuracao()
-    )
+    configuracao = carregar_configuracao()
+    hoje = datetime.now(FUSO_BRASILIA)
 
-    hoje = datetime.now(
-        FUSO_BRASILIA
-    )
-
-    executar, motivo = (
-        data_execucao_valida(
-            configuracao,
-            hoje,
-        )
+    executar, motivo = data_execucao_valida(
+        configuracao,
+        hoje,
     )
 
     if not executar:
-        print(
-            "Execução ignorada: "
-            f"{motivo}."
-        )
+        print(f"Execução ignorada: {motivo}.")
         return
 
-    print(
-        "Lendo indisponibilidades..."
-    )
-
-    indisponiveis = (
-        carregar_indisponibilidades(
-            hoje
-        )
-    )
+    print("Lendo indisponibilidades...")
+    indisponiveis = carregar_indisponibilidades(hoje)
 
     print(
         "Indisponíveis hoje: "
         + (
-            ", ".join(
-                sorted(
-                    indisponiveis
-                )
-            )
+            ", ".join(sorted(indisponiveis))
             if indisponiveis
             else "nenhum"
         )
     )
 
     supabase = criar_supabase()
+    sessao_iilex = criar_sessao_iilex()
 
-    print(
-        "Carregando Contencioso..."
-    )
-
+    print("Carregando Contencioso...")
     contencioso = ler_tabela(
         supabase,
         TABELA_CONTENCIOSO,
     )
+    print(f"Contencioso: {len(contencioso):,}")
 
-    print(
-        f"Contencioso: "
-        f"{len(contencioso):,}"
-    )
-
-    print(
-        "Carregando último Histórico..."
-    )
-
+    print("Carregando último Histórico...")
     historico = ler_tabela(
         supabase,
         TABELA_ULTIMO_HISTORICO,
     )
+    print(f"Último Histórico: {len(historico):,}")
 
-    print(
-        f"Último Histórico: "
-        f"{len(historico):,}"
-    )
-
-    print(
-        "Carregando Agenda..."
-    )
-
+    print("Carregando Agenda...")
     agenda = ler_tabela(
         supabase,
         TABELA_AGENDA,
     )
+    print(f"Agenda: {len(agenda):,}")
 
-    print(
-        f"Agenda: "
-        f"{len(agenda):,}"
-    )
-
-    print(
-        "Carregando controle..."
-    )
-
+    print("Carregando controle...")
     controle = ler_tabela(
         supabase,
         TABELA_CONTROLE,
     )
-
-    print(
-        f"Controle: "
-        f"{len(controle):,}"
-    )
+    print(f"Controle: {len(controle):,}")
 
     selecionados = selecionar_processos(
         contencioso,
@@ -1079,8 +839,11 @@ def main():
         hoje,
     )
 
-    mostrar_resultado(
+    executar_agendamentos(
+        supabase,
+        sessao_iilex,
         selecionados,
+        configuracao,
         indisponiveis,
         hoje,
     )
