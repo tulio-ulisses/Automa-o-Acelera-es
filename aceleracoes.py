@@ -1,4 +1,3 @@
-
 import os
 import re
 import csv
@@ -47,9 +46,30 @@ MAPA_NOMES_PLANILHA = {
 
 def env(nome):
     valor = os.getenv(nome)
-    if not valor:
-        raise RuntimeError(f"Variável de ambiente ausente: {nome}")
-    return valor
+
+    if valor:
+        return valor
+
+    try:
+        import credenciais
+    except ImportError:
+        credenciais = None
+
+    if credenciais:
+        valor = getattr(
+            credenciais,
+            nome,
+            None,
+        )
+
+        if valor:
+            return valor
+
+    raise RuntimeError(
+        f"Credencial ausente: {nome}. "
+        "Configure como variável de ambiente "
+        "ou no arquivo credenciais.py."
+    )
 
 
 def normalizar_texto(valor):
@@ -363,25 +383,110 @@ def obter_processos_acelerados_agenda(agenda, hoje):
     return acelerados
 
 
-def obter_processos_controle(controle, hoje):
-    bloqueados = set()
+def obter_ultima_aceleracao_por_processo(controle):
+    """
+    Retorna a data da última aceleração válida de cada número de processo.
+
+    A chave é o número CNJ normalizado, independentemente do idprocesso/pasta.
+    Isso evita que pastas duplicadas do mesmo processo sejam tratadas como
+    processos diferentes.
+
+    Registros com ERRO_IILEX ou CANCELADO não contam como aceleração válida.
+    RESERVADO é mantido como bloqueio conservador para evitar duplicação caso
+    uma execução tenha sido interrompida entre o POST no IILEX e a atualização
+    final do controle.
+    """
+    ultimas = {}
 
     for registro in controle:
-        data_agendamento = converter_data(
-            registro.get("data_agendamento")
-        )
+        status = normalizar_texto(registro.get("status"))
 
-        if data_agendamento != hoje.date():
+        if status in {
+            "erro iilex",
+            "cancelado",
+        }:
             continue
 
         processo = normalizar_processo(
             registro.get("processo")
         )
+        data_agendamento = converter_data(
+            registro.get("data_agendamento")
+        )
 
-        if processo:
-            bloqueados.add(processo)
+        if not processo or not data_agendamento:
+            continue
 
-    return bloqueados
+        data_atual = ultimas.get(processo)
+        if data_atual is None or data_agendamento > data_atual:
+            ultimas[processo] = data_agendamento
+
+    return ultimas
+
+
+def criar_mapa_processos_canonicos(
+    contencioso,
+    mapa_historico,
+    coluna_processo,
+    coluna_idprocesso,
+    coluna_status,
+):
+    """
+    Consolida duplicidades do Contencioso por número CNJ.
+
+    Para cada número de processo, considera apenas pastas ATIVAS e escolhe
+    como pasta canônica aquela que possui o histórico mais recente.
+    Em empate de data, usa o maior idprocesso como desempate determinístico.
+
+    A regra é conservadora: se existe uma pasta ativa do mesmo CNJ com
+    movimentação mais recente, uma cópia antiga/stagnada não pode fazer o
+    processo parecer parado e gerar uma aceleração indevida.
+    """
+    canonicos = {}
+
+    for registro in contencioso:
+        if not status_ativo(registro.get(coluna_status)):
+            continue
+
+        processo_original = str(
+            registro.get(coluna_processo, "")
+        ).strip()
+        processo = normalizar_processo(processo_original)
+
+        if not processo:
+            continue
+
+        idprocesso = str(
+            registro.get(coluna_idprocesso, "")
+        ).strip()
+
+        if not idprocesso:
+            continue
+
+        data_ultimo_historico = mapa_historico.get(idprocesso)
+        if not data_ultimo_historico:
+            continue
+
+        id_numerico = inteiro(idprocesso)
+        chave_desempate = (
+            data_ultimo_historico,
+            id_numerico if id_numerico is not None else -1,
+            idprocesso,
+        )
+
+        atual = canonicos.get(processo)
+
+        if atual is None or chave_desempate > atual["chave_desempate"]:
+            canonicos[processo] = {
+                "registro": registro,
+                "processo": processo,
+                "processo_original": processo_original,
+                "idprocesso": idprocesso,
+                "data_ultimo_historico": data_ultimo_historico,
+                "chave_desempate": chave_desempate,
+            }
+
+    return canonicos
 
 
 def selecionar_processos(
@@ -457,13 +562,36 @@ def selecionar_processos(
     )
 
     mapa_historico = criar_mapa_ultimo_historico(historico)
-    acelerados_agenda = obter_processos_acelerados_agenda(agenda, hoje)
-    acelerados_controle = obter_processos_controle(controle, hoje)
 
-    bloqueados = acelerados_agenda | acelerados_controle
-    quantidade = int(configuracao.get("quantidade_por_responsavel", 2))
+    # Bloqueio adicional para o próprio dia usando a Agenda do IILEX.
+    acelerados_agenda_hoje = obter_processos_acelerados_agenda(
+        agenda,
+        hoje,
+    )
+
+    # Última aceleração conhecida por número CNJ, independentemente da pasta.
+    ultima_aceleracao = obter_ultima_aceleracao_por_processo(
+        controle
+    )
+
+    # Consolida as várias pastas do mesmo CNJ em uma única pasta canônica.
+    processos_canonicos = criar_mapa_processos_canonicos(
+        contencioso,
+        mapa_historico,
+        coluna_processo,
+        coluna_idprocesso,
+        coluna_status,
+    )
+
+    quantidade = int(
+        configuracao.get(
+            "quantidade_por_responsavel",
+            2,
+        )
+    )
 
     resultado = {}
+    selecionados_no_lote = set()
 
     for responsavel in configuracao.get("responsaveis", []):
         nome = responsavel.get("nome")
@@ -478,10 +606,10 @@ def selecionar_processos(
 
         candidatos = []
 
-        for registro in contencioso:
-            if not status_ativo(registro.get(coluna_status)):
-                continue
+        for processo, canonico in processos_canonicos.items():
+            registro = canonico["registro"]
 
+            # Mantém a regra de negócio já existente de excluir Risco 4.
             if eh_risco_4(registro.get(coluna_risco)):
                 continue
 
@@ -493,36 +621,43 @@ def selecionar_processos(
             ):
                 continue
 
-            processo_original = str(
-                registro.get(coluna_processo, "")
-            ).strip()
-
-            processo = normalizar_processo(processo_original)
-
-            if not processo or processo in bloqueados:
+            if processo in acelerados_agenda_hoje:
                 continue
 
-            idprocesso = str(
-                registro.get(coluna_idprocesso, "")
-            ).strip()
+            data_ultimo_historico = canonico[
+                "data_ultimo_historico"
+            ]
 
-            if not idprocesso:
-                continue
+            data_ultima_aceleracao = ultima_aceleracao.get(
+                processo
+            )
 
-            data_ultimo_historico = mapa_historico.get(idprocesso)
-            if not data_ultimo_historico:
+            # Regra central:
+            # - se nunca foi acelerado, pode ser candidato;
+            # - se já foi acelerado, só volta a ficar elegível depois de
+            #   uma NOVA movimentação posterior à última aceleração.
+            #
+            # Assim, duplicidades de idprocesso não conseguem fazer o mesmo
+            # CNJ reaparecer usando o histórico antigo de outra pasta.
+            if (
+                data_ultima_aceleracao
+                and data_ultimo_historico <= data_ultima_aceleracao
+            ):
                 continue
 
             candidatos.append(
                 {
                     "processo": processo,
-                    "processo_original": processo_original,
-                    "idprocesso": idprocesso,
+                    "processo_original": canonico[
+                        "processo_original"
+                    ],
+                    "idprocesso": canonico["idprocesso"],
                     "responsavel": nome,
                     "idusuario": responsavel.get("idusuario"),
                     "risco": registro.get(coluna_risco),
                     "status": registro.get(coluna_status),
                     "data_ultimo_historico": data_ultimo_historico,
+                    "data_ultima_aceleracao": data_ultima_aceleracao,
                 }
             )
 
@@ -530,7 +665,21 @@ def selecionar_processos(
             key=lambda item: item["data_ultimo_historico"]
         )
 
-        resultado[nome] = candidatos[:quantidade]
+        escolhidos = []
+
+        for item in candidatos:
+            processo = item["processo"]
+
+            if processo in selecionados_no_lote:
+                continue
+
+            escolhidos.append(item)
+            selecionados_no_lote.add(processo)
+
+            if len(escolhidos) >= quantidade:
+                break
+
+        resultado[nome] = escolhidos
 
     return resultado
 
